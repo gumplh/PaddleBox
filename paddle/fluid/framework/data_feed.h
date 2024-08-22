@@ -58,6 +58,7 @@ DECLARE_bool(padbox_auc_runner_mode);
 DECLARE_bool(enable_slotpool_wait_release);
 DECLARE_bool(enable_slotrecord_reset_shrink);
 DECLARE_bool(enable_ins_parser_add_file_path);
+DECLARE_bool(enable_async_datafeed_batch);
 
 namespace paddle {
 namespace framework {
@@ -533,6 +534,7 @@ class MiniBatchGpuPack {
   ~MiniBatchGpuPack();
   void set_merge_by_uid(bool merge_by_uid);
   void set_merge_by_uid_split_method(int split_method);
+  void set_need_time_info(bool need_time_info);
   void reset(const paddle::platform::Place& place);
   void pack_pvinstance(const SlotPvInstance* pv_ins, int num);
   void pack_instance(const SlotRecord* ins_vec, int num);
@@ -619,6 +621,7 @@ class MiniBatchGpuPack {
 
   bool enable_pv_ = false;
   bool enable_pv_by_uid_ = false;
+  bool need_time_info_ = false;
   int merge_by_uid_split_method_ = 0; // 0 no split, 1 direct split, 2 mask split
   int used_float_num_ = 0;
   int used_uint64_num_ = 0;
@@ -647,6 +650,7 @@ class MiniBatchGpuPack {
   const int extend_dim_ = FLAGS_padbox_slotrecord_extend_dim;
   LoDTensor* qvalue_tensor_ = nullptr;
 };
+
 class MiniBatchGpuPackMgr {
   static const int MAX_DEIVCE_NUM = 16;
  public:
@@ -689,6 +693,218 @@ inline MiniBatchGpuPackMgr& BatchGpuPackMgr() {
   static MiniBatchGpuPackMgr mgr;
   return mgr;
 }
+
+class MiniBatchSlotPvTensorBuffer {
+public:
+  MiniBatchSlotPvTensorBuffer(const std::vector<UsedSlotInfo>& infos, 
+                              const paddle::platform::Place& place) : place_(place) {
+    used_slot_size_ = static_cast<int>(infos.size());
+    offsets_ = std::vector<std::vector<size_t>>(used_slot_size_);
+    batch_float_feasigns_ = std::vector<std::vector<float>>(used_slot_size_);
+    batch_uint64_feasigns_ = std::vector<std::vector<uint64_t>>(used_slot_size_);
+    feed_vec_ = std::vector<LoDTensor>(used_slot_size_);
+
+    used_float_num_ = used_uint64_num_ = 0;
+    for (int i = 0; i < used_slot_size_; ++i) {
+      auto& info = infos[i];
+      if (info.type[0] == 'u') {
+        ++used_uint64_num_;
+      } else {
+        ++used_float_num_;
+      }
+    }
+  }
+
+  void resize_pv_tensor(int pv_row, int pv_col) {
+    pv_tensor_.mutable_data<int>({pv_row, pv_col}, this->place_);
+  }
+
+  void resize_tensor(int float_total_len, int uint64_total_len) {
+    // alloc memory
+    if (used_float_num_ > 0) {
+      float_tensor_.mutable_data<float>({float_total_len + used_float_num_, 1}, this->place_);
+    }
+    if (used_uint64_num_ > 0) {
+      uint64_tensor_.mutable_data<int64_t>({uint64_total_len + used_uint64_num_, 1}, this->place_);
+    }
+  }
+
+  void resize_ads_offset_tensor(int pv_ins_num) {
+    ads_offset_tensor_.mutable_data<int>({pv_ins_num + 1, 1}, this->place_);
+  }
+
+  void resize_time_stamp_tensor(int ins_num) {
+    ads_time_stamp_tensor_.mutable_data<int64_t>({ins_num, 1}, this->place_);
+  }
+
+  void resize_train_mask_tensor(int ins_num) {
+    ads_train_mask_tensor_.mutable_data<int64_t>({ins_num, 1}, this->place_);
+  }
+  
+  void resize_qvalue_tensor(int len) {
+    qvalue_tensor_.mutable_data<float>({len, 1}, this->place_);
+  }
+
+  bool valid() {
+    return buffer_done_.valid();
+  }
+
+  void wait_buffer_done(bool need_pv = false) {
+    PADDLE_ENFORCE(buffer_done_.valid(), "invalid future parameter");
+    PADDLE_ENFORCE(buffer_done_.get(), "invalid future results");
+  }
+
+  void set_buffer_done(std::future<bool> && buffer_done) {
+    buffer_done_ = std::move(buffer_done);
+  }
+  
+  LoDTensor & uint64_tensor() {
+    return uint64_tensor_;
+  }
+
+  LoDTensor & float_tensor() {
+    return float_tensor_;
+  }
+
+  LoDTensor & pv_tensor() {
+    return pv_tensor_;
+  }
+
+  LoDTensor & ads_offset_tensor() {
+    return ads_offset_tensor_;
+  }
+
+  LoDTensor & ads_time_stamp_tensor() {
+    return ads_time_stamp_tensor_;
+  }
+
+  LoDTensor & ads_train_mask_tensor() {
+    return ads_train_mask_tensor_;
+  }
+
+  LoDTensor & qvalue_tensor() {
+    return qvalue_tensor_;
+  }
+
+  std::vector<LoDTensor> & feed_vec() {
+    return feed_vec_;
+  }
+
+  std::vector<SlotRecord> & pv_ins_vec() {
+    return pv_ins_vec_;
+  }
+
+  std::vector<std::vector<float>> & batch_float_feasigns() {
+    return batch_float_feasigns_;
+  }
+
+  std::vector<std::vector<uint64_t>> & batch_uint64_feasigns() {
+    return batch_uint64_feasigns_;
+  }
+
+  std::vector<std::vector<size_t>> & offsets() {
+    return offsets_;
+  }
+
+  std::vector<int> & ads_offset() {
+    return ads_offset_;
+  }
+
+  std::vector<uint64_t> & ads_time_stamp() {
+    return ads_time_stamp_;
+  }
+
+  std::vector<uint64_t> & ads_train_mask() {
+    return ads_train_mask_;
+  }
+
+  std::vector<float> & qvalue() {
+    return qvalue_;
+  }
+
+private:
+  // uint64 tensor
+  LoDTensor uint64_tensor_;
+  // float tensor
+  LoDTensor float_tensor_;
+  // pv tensor
+  LoDTensor pv_tensor_;
+
+  // for GR task
+  LoDTensor ads_offset_tensor_;
+  LoDTensor ads_time_stamp_tensor_;
+  LoDTensor ads_train_mask_tensor_;
+  std::vector<int> ads_offset_;
+  std::vector<uint64_t> ads_time_stamp_;
+  std::vector<uint64_t> ads_train_mask_;
+
+  // qvalue
+  const int extend_dim_ = FLAGS_padbox_slotrecord_extend_dim;
+  std::vector<float> qvalue_;
+  LoDTensor qvalue_tensor_;
+
+  std::vector<SlotRecord> pv_ins_vec_;
+  paddle::platform::Place place_;
+
+  int used_float_num_;
+  int used_uint64_num_;
+  int used_slot_size_;
+
+  std::vector<std::vector<size_t>> offsets_;
+  std::vector<std::vector<float>> batch_float_feasigns_;
+  std::vector<std::vector<uint64_t>> batch_uint64_feasigns_;
+  std::vector<LoDTensor> feed_vec_;
+
+  std::future<bool> buffer_done_;
+};
+
+#ifdef PADDLE_WITH_CUDA
+struct DataFeedStreamMgr {
+public:
+  static DataFeedStreamMgr& getInstance() {
+    static DataFeedStreamMgr instance;
+    return instance;
+  }
+
+  DataFeedStreamMgr(const DataFeedStreamMgr&) = delete;
+  DataFeedStreamMgr& operator=(const DataFeedStreamMgr&) = delete;
+  
+  cudaStream_t get_stream(int index) {
+      if (index >= 0 && index < deviceCount) {
+          return streams[index];
+      } else {
+          std::cerr << "Index out of range!" << std::endl;
+          return nullptr;
+      }
+  }
+
+private:
+  DataFeedStreamMgr() {
+      cudaGetDeviceCount(&deviceCount);
+      streams.resize(deviceCount, nullptr);
+      if (deviceCount <= 0) {
+          std::cerr << "No CUDA devices found!" << std::endl;
+          return;
+      }
+
+      // Initialize CUDA streams
+      for (int i = 0; i < deviceCount; ++i) {
+          cudaSetDevice(i);
+          cudaStreamCreate(&streams[i]);
+      }
+  }
+
+  ~DataFeedStreamMgr() {
+    for (int i = 0; i < deviceCount; ++i) {
+        cudaStreamDestroy(streams[i]);
+    }
+  }
+
+  int deviceCount = 0;
+  std::vector<cudaStream_t> streams;
+};
+#endif
+
 #endif
 
 typedef paddle::framework::CustomParser* (*CreateParserObjectFunc)();
@@ -1105,6 +1321,7 @@ class DataFeed {
   // safe).
   virtual bool PickOneFile(std::string* filename);
   virtual void CopyToFeedTensor(void* dst, const void* src, size_t size);
+  virtual void CopyToFeedTensorAsync(void* dst, const void* src, size_t size);
 
   std::vector<std::string> filelist_;
   size_t* file_idx_;
@@ -2107,6 +2324,11 @@ class SlotPaddleBoxDataFeed : public DataFeed {
   virtual void SetSeqSplitMethod(int merge_by_uid_split_method) {
     merge_by_uid_split_method_ = merge_by_uid_split_method;
   }
+
+  virtual void SetNeedTimeInfo(bool need_time_info) {
+    need_time_info_ = need_time_info;
+  }
+
   void SetTestMode(bool is_test) {
     is_test_ = is_test;
   }
@@ -2116,16 +2338,26 @@ class SlotPaddleBoxDataFeed : public DataFeed {
   virtual void SetCurrentPhase(int current_phase) {
     current_phase_ = current_phase;
   }
+
   virtual const std::string& GetLineId(int idx) const {
-#if defined(PADDLE_WITH_CUDA) && defined(_LINUX)
-    return pack_->get_lineid(idx);
+#if defined(PADDLE_WITH_CUDA) && defined(_LINUX) || defined(PADDLE_WITH_XPU_KP) && !defined(CPU_DATA_FEED)
+    if (FLAGS_enable_async_datafeed_batch) {
+      return ins_record_ptr_[idx]->ins_id_;
+    } else {
+      return pack_->get_lineid(idx);
+    }
 #else
     return ins_record_ptr_[idx]->ins_id_;
 #endif
   }
+
   virtual int GetCurBatchSize() {
-#if defined(PADDLE_WITH_CUDA)
-    return pack_->ins_num();
+#if defined(PADDLE_WITH_CUDA) && defined(_LINUX) || defined(PADDLE_WITH_XPU_KP) && !defined(CPU_DATA_FEED)
+    if (FLAGS_enable_async_datafeed_batch) {
+      return batch_ins_num_;
+    } else {
+      return pack_->ins_num();
+    }
 #else
     return batch_ins_num_;
 #endif
@@ -2178,6 +2410,9 @@ class SlotPaddleBoxDataFeed : public DataFeed {
   virtual void LoadIntoMemoryByArchive(void);
 
  private:
+  void CalRankOffsetCPU(const SlotPvInstance* pv_vec, int pv_num, int ins_number, 
+                        std::vector<int> & rank_offset_mat, int max_rank, int row, int col);
+
 #if defined(PADDLE_WITH_CUDA) && defined(_LINUX)
   void CopyRankOffset(int* dest, const int ins_num, const int pv_num,
                       const int max_rank, const int* ranks, const int* cmatchs,
@@ -2203,6 +2438,9 @@ class SlotPaddleBoxDataFeed : public DataFeed {
 
                      const UsedSlotGpuType* used_slots);
 #endif
+  bool PrefechNextBatch(const SlotRecord* ins_vec, int num);
+  bool PrefechNextBatchWithPv(const SlotPvInstance* pvs, int num);
+
 
  protected:
   int thread_id_ = 0;
@@ -2213,6 +2451,7 @@ class SlotPaddleBoxDataFeed : public DataFeed {
   bool enable_pv_merge_ = false;
   bool merge_by_uid_ = false;
   int merge_by_uid_split_method_ = 0;
+  bool need_time_info_ = false;
   bool is_test_ = false;
   std::pair<uint64_t, uint64_t> test_timestamp_range_;
   int current_phase_{-1};  // only for untest
@@ -2236,11 +2475,15 @@ class SlotPaddleBoxDataFeed : public DataFeed {
 
 #if defined(PADDLE_WITH_CUDA) && defined(_LINUX)
   MiniBatchGpuPack* pack_ = nullptr;
-#else
+#endif
   std::vector<SlotRecord> pv_ins_vec_;
   const SlotRecord *ins_record_ptr_ = nullptr;
   int batch_ins_num_ = 0;
-#endif
+
+
+  std::shared_ptr<MiniBatchSlotPvTensorBuffer> slot_pv_tensor_buf_ = nullptr;
+  std::shared_ptr<MiniBatchSlotPvTensorBuffer> slot_pv_tensor_buf_next_ = nullptr;
+
   int offset_index_ = 0;
   std::vector<std::pair<int, int>> batch_offsets_;
   SlotPvInstance* pv_ins_ = nullptr;

@@ -225,6 +225,11 @@ void DatasetImpl<T>::SetInvalidUsers(std::unordered_set<std::string> invalid_use
 }
 
 template <typename T>
+void DatasetImpl<T>::SetNeedTimeInfo(bool need_time_info) {
+  need_time_info_ = need_time_info;
+}
+
+template <typename T>
 void DatasetImpl<T>::SetTestMode(bool is_test) {
   is_test_ = is_test;
 }
@@ -3131,6 +3136,7 @@ void PadBoxSlotDataset::PrepareTrain(void) {
       feed->SetMergeByUid(merge_by_uid_);
       feed->SetSeqSplitMethod(merge_by_uid_split_method_);
       feed->SetPvInstance(&input_pv_ins_[0]);
+      feed->SetNeedTimeInfo(need_time_info_);
     }
     for (size_t i = 0; i < offset.size(); ++i) {
       reinterpret_cast<SlotPaddleBoxDataFeed*>(readers_[i % thread_num_].get())
@@ -3152,6 +3158,7 @@ void PadBoxSlotDataset::PrepareTrain(void) {
           reinterpret_cast<SlotPaddleBoxDataFeed*>(readers_[i].get());
       feed->SetEnablePvMerge(false);
       feed->SetSlotRecord(&input_records_[0]);
+      feed->SetNeedTimeInfo(need_time_info_);
     }
     for (size_t i = 0; i < offset.size(); ++i) {
       reinterpret_cast<SlotPaddleBoxDataFeed*>(readers_[i % thread_num_].get())
